@@ -1,0 +1,23 @@
+# Video Archiver — RSS Feed List
+# ──────────────────────────────
+# Add one feed URL per line.
+# Lines starting with # are comments and are ignored.
+# Blank lines are also ignored.
+#
+# Examples of feed types that commonly contain video links:
+#
+# YouTube channel RSS feeds (replace CHANNEL_ID):
+#   https://www.youtube.com/feeds/videos.xml?channel_id=CHANNEL_ID
+#
+# YouTube playlist RSS feeds (replace PLAYLIST_ID):
+#   https://www.youtube.com/feeds/videos.xml?playlist_id=PLAYLIST_ID
+#
+# Vimeo user/channel feeds:
+#   https://vimeo.com/USER/videos/rss
+#
+# Blog or news feeds that embed videos:
+#   https://example.com/feed
+#
+# ──────────────────────────────
+# Add your feeds below:
+
