@@ -10,6 +10,8 @@ RSS feed monitor that automatically detects, downloads, and tracks YouTube and V
 
 ## Setup
 
+Requires **Python 3.11+**, the `yt-dlp` command on your `PATH`, and `ffmpeg`.
+
 ```bash
 # Install dependencies
 pip install -r requirements.txt
@@ -131,3 +133,7 @@ The scanner searches every RSS entry's link, title, summary, description, conten
 ## Download quality
 
 Videos are downloaded at the **highest available quality** using `yt-dlp`'s `bestvideo+bestaudio/best` format selection, merged into MKV containers via ffmpeg. This means you'll typically get the best resolution available (often 4K or 1080p) with the best audio track.
+
+## For contributors and AI agents
+
+See [`AGENTS.md`](AGENTS.md) (also loaded through `CLAUDE.md`), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), and [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
