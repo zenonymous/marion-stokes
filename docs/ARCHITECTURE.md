@@ -1,99 +1,90 @@
 # Architecture
 
-All code lives in `video_archiver.py`. This document explains how it fits together.
-Line numbers refer to the version this document was written against. Search for
-function names if they have drifted.
-
 ## Big picture
 
 ```
-feeds.txt ──► load_feeds ──► scan_feed (feedparser) ──► find_video_urls
-                                                          │ canonical URL + platform + id
-                                                          ▼
-                                  video_exists? ──yes──► skip
-                                        │ no
-                                        ▼
-                         download_video (yt-dlp subprocess) ──fail──► log, skip (retried next scan)
-                                        │ ok: metadata dict
-                                        ▼
-                                  insert_video ──► videos.db
+feeds.txt ─► feeds.load_feeds ─► feeds.scan_feed ─► detect.find_video_urls ─► VideoRef
+                                  (one bad feed is logged, then skipped)          │
+                                                                                  ▼
+             already in videos? ─yes─► skip
+             in failed_downloads and backing off / given up? ─yes─► defer
+                     │ no
+                     ▼
+             ytdlp.download(fetch_url) ──ok──► db.insert_video, db.clear_failure
+                     │ fail: classify_error(stderr) → Verdict
+                     ├─ UPCOMING / THROTTLED ─► record, no penalty (THROTTLED stops downloads this run)
+                     └─ other ─► record attempt, exponential backoff, give up after --max-attempts
 
-videos.db ──► run_check ──► check_availability (yt-dlp --simulate) ──► mark_deleted / mark_available
-videos.db ──► run_status ──► stdout summary
+videos (least recently checked first, --check-limit) ─► ytdlp.probe(fetch_url) ─► Verdict
+    AVAILABLE / GEO_BLOCKED / RESTRICTED ─► exists: set state, restore if it was gone
+    REMOVED / PRIVATE                    ─► gone immediately
+    GONE_WEAK                            ─► strike; gone once strikes ≥ --confirm-checks
+    UNKNOWN / UPCOMING                   ─► leave state, update last_checked only
+    THROTTLED                            ─► skip; stop the run after 3 in a row
+  ─► notify.send(new gone / restored)
 ```
 
-There are three independent subcommands, and each opens its own SQLite
-connection. Nothing runs concurrently, and there is no lock against two
-overlapping runs.
+## Modules
 
-## Modules (sections of the script)
+### `detect.py`
+- `find_video_urls(text)` HTML-unescapes the text, runs the YouTube and Vimeo
+  patterns, and returns `VideoRef`s deduplicated on `(platform, video_id)` in order
+  of first appearance. When a Vimeo video shows up both with and without its
+  privacy hash, the hashed `fetch_url` wins.
+- YouTube IDs must be exactly 11 characters, `[A-Za-z0-9_-]`.
+- Canonical forms: `https://www.youtube.com/watch?v=ID` and `https://vimeo.com/ID`.
+  Unlisted Vimeo videos get the fetch URL `https://vimeo.com/ID/HASH`.
 
-### Logging: `setup_logging`
-The `video_archiver` logger writes to a file handler (always DEBUG) and a console
-handler (INFO, or DEBUG with `-v`). The logger is passed to functions explicitly.
+### `feeds.py`
+- `feedparser.parse(url, sanitize_html=False)`. The sanitizer would strip the
+  `<iframe>` embeds that blogs use for players.
+- `entry_text` joins link, title, summary, description, content, links,
+  `media_content`, and `media_player`.
+- It raises `FeedError` for unparseable feeds and HTTP ≥ 400. `run_scan` catches this for each feed.
 
-### Database: `DB_SCHEMA`, `init_db`, `video_exists`, `insert_video`, `mark_deleted`, `mark_available`, `get_all_videos`
-- One table, `videos`. The README has the full column table.
-- `init_db` runs `CREATE TABLE/INDEX IF NOT EXISTS` on every start, so it cannot
-  migrate an existing table. New columns need an explicit `ALTER TABLE`.
-- `platform` has a `CHECK (platform IN ('youtube','vimeo'))` constraint.
-- Timestamps are ISO 8601 UTC strings (`datetime.now(datetime.UTC).isoformat()`).
-- Each helper commits right away. There are no batched transactions.
-- `idx_videos_url` duplicates the index SQLite already builds for `UNIQUE`.
+### `ytdlp.py`
+- `download()` builds the command in `build_download_cmd`:
+  `-f bestvideo+bestaudio/best --merge-output-format mkv --write-info-json
+  --match-filters !is_live --no-simulate --print after_move:%()j` (+ `--write-thumbnail`,
+  and optionally `--write-subs --sub-langs all,-live_chat`). Output template:
+  `<dir>/%(extractor)s/%(id)s - %(title)s.%(ext)s`. Timeout 1 h.
+- `extract_record_fields()` stores the real on-disk size and an integer duration.
+- `probe()` runs `yt-dlp --simulate --no-playlist --print id URL`, with a 120 s timeout.
+- `classify_error()` goes through `_RULES` in order: THROTTLED, GEO_BLOCKED, UPCOMING,
+  RESTRICTED, PRIVATE, REMOVED, GONE_WEAK, and falls back to UNKNOWN. The order
+  matters because YouTube prefixes rate limits and geo-blocks with "Video unavailable.".
+  Only `ERROR:` lines from stderr are classified.
 
-### URL detection: `VIDEO_PATTERNS`, `detect_platform`, `extract_video_id`, `canonical_url`, `find_video_urls`
-- `find_video_urls(text)` runs every regex over a text blob, strips trailing
-  punctuation, works out the platform and ID, canonicalises the URL, and
-  dedupes on `(platform, id)`.
-- Canonical forms: `https://www.youtube.com/watch?v=<id>` and `https://vimeo.com/<id>`.
-- Recognised: `youtube.com/watch?…v=`, `youtu.be/`, `youtube.com/embed/`, `/v/`, `/shorts/`,
-  `vimeo.com/<digits>`, `player.vimeo.com/video/<digits>`.
-- Not recognised (checked): `m.youtube.com`, `youtube-nocookie.com`, `youtube.com/live/`,
-  `vimeo.com/channels/<name>/<id>`.
+### `db.py`
+- `MIGRATIONS` is a list of functions. `PRAGMA user_version` is the number that
+  have been applied. Version 0 means a DB from the original script (or a new one).
+  v1 is the original schema, written with `IF NOT EXISTS` so legacy DBs pass through
+  untouched. v2 renames `canonical_url` to `fetch_url`, and adds `availability`,
+  `gone_strikes`, `gone_since`, the `failed_downloads` table, a unique
+  `(platform, video_id)` index, and an index on `last_checked`. It also drops a
+  redundant index, cleans up `duration='None'`, and backfills real file sizes.
+- `migrate()` backs up an existing DB with SQLite's backup API before it upgrades.
+  It refuses to open a DB with a newer schema than the code.
+- Availability constants: `AVAILABLE`, `GEO_BLOCKED`, `RESTRICTED`, `REMOVED`,
+  `PRIVATE`, `UNAVAILABLE`. `GONE_STATES` sets `is_available = 0`.
+- Backoff in `record_failure`: `2^(attempts-1)` hours, capped at 168 h. Once
+  `attempts ≥ max_attempts`, `gave_up = 1`.
 
-### Feed reading: `load_feeds`, `scan_feed`
-- `load_feeds` returns non-empty lines that don't start with `#`.
-- `scan_feed` calls `feedparser.parse(url)`. If the result is bozo with no entries,
-  the feed is skipped with a warning. For each entry, it joins `link`, `title`,
-  `summary`, `description`, every `content[].value`, `links[].href`,
-  `media_content[].url`, and `media_player.url`/`content` into one blob, then runs
-  `find_video_urls` on it. Each hit gets `feed_source` and `entry_title` added.
+### `workflows.py`
+The `run_*(args, logger) -> int` functions return the number of errors that
+weren't fatal. `cli.main` turns a non-zero count into exit code 2.
+`deleted_date` records the *first* detection. For a generic "gone" result, that
+is `gone_since`, the time of the first strike.
 
-### Download: `ytdlp_available`, `download_video`
-The script shells out to:
-```
-yt-dlp --no-playlist -f bestvideo+bestaudio/best --merge-output-format mkv
-       --write-info-json --output "<dir>/%(extractor)s/%(id)s - %(title)s.%(ext)s"
-       --print-json --no-progress <url>
-```
-- The timeout is 1 hour. A non-zero exit code or a timeout returns `None`.
-- The last JSON line on stdout is parsed. The script keeps `_filename`, `filesize`
-  (or `filesize_approx`), `duration`, `uploader`, `resolution`, and a subset of
-  metadata keys, serialised into `metadata_json`.
-- yt-dlp also writes a `.info.json` next to each video, with the full metadata.
-
-### Availability: `check_availability`
-- Runs `yt-dlp --simulate --skip-download --no-playlist --print id <url>` with a 120 s timeout.
-- Exit code 0 means available.
-- A non-zero exit code means **deleted only if** stderr (lower-cased) contains one of
-  the `unavailable_signals` substrings. Any other error, or a timeout, counts as
-  *available*, and the script logs a warning.
-
-### Workflows: `run_scan`, `run_check`, `run_status`, `main`
-- `run_scan`: for each feed, and each video found in it, skip it if its canonical
-  URL is already in the DB. Otherwise download it, and insert a row only if the
-  download succeeded. The title comes from yt-dlp, with the feed entry title as fallback.
-- `run_check`: loads every row, including rows already marked deleted, so a
-  video that comes back gets restored. The transitions are:
-  - available → gone: `mark_deleted` (sets `deleted_date`)
-  - gone → available: `mark_available` (clears `deleted_date`)
-  - available → available: updates `last_checked`
-  - gone → gone: **no update**, so `last_checked` stays unchanged
-- `run_status`: prints counts and the list of deleted videos.
-- `main`: argparse, then logging, then it exits with an error if the yt-dlp CLI is missing, then dispatches.
+### `cli.py`
+- Subcommands share a parent parser, `common`, with `--db --feeds --download-dir --log -v --notify-url`.
+- `run_lock` takes a non-blocking `fcntl.flock` on `<db>.lock` for scan, check, and retry.
+- Exit codes: 0 ok, 1 fatal, 2 partial, 3 locked.
+- The yt-dlp binary is required only for scan and check.
 
 ## Operations
-
-- `cron_run.sh` changes into the script directory and runs `scan "$@"`, then `check "$@"`,
-  under `set -euo pipefail`. A crash in `scan` means `check` doesn't run.
-- All default paths are relative to the working directory. That's why the cron wrapper `cd`s first.
+- `cron_run.sh` runs scan and then check. Check still runs if scan fails. The
+  script exits with the higher of the two exit codes. If `./.venv` exists, the
+  script uses its Python and puts its `bin/` (for yt-dlp) on `PATH`.
+- Relative default paths resolve against the working directory, which is why
+  `cron_run.sh` changes into the repo directory first.

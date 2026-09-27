@@ -1,99 +1,100 @@
 # AGENTS.md — guide for AI coding agents
 
 Read this first. It is the shortest path to being productive in this repo.
-Deeper material: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (how it works) and
-[`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) (verified bugs and limitations).
+Deeper material: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (how it works),
+[`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) (open limitations), and
+[`CHANGELOG.md`](CHANGELOG.md).
 
 ## What this project is
 
-**marion-stokes** is a small personal *video preservation* tool, named after
+**marion-stokes** is a personal *video preservation* tool, named after
 [Marion Stokes](https://en.wikipedia.org/wiki/Marion_Stokes), who taped TV news
-around the clock for decades so it wouldn't be lost.
+around the clock for decades so it wouldn't be lost. The owner runs it with cron
+on a **home server**.
 
-It watches RSS/Atom feeds, finds YouTube and Vimeo links in them, downloads
-each new video at the best available quality with `yt-dlp`, records it in
-SQLite, and later re-checks whether each video is **still online**. The key
-output is a list of videos that have been **deleted or made private upstream**
-but are still kept locally.
+It watches RSS/Atom feeds, finds YouTube and Vimeo links in them, downloads each
+new video at the best available quality with `yt-dlp`, and records it in SQLite.
+It then keeps re-checking whether each video is **still online**. The key
+output is the list of videos that have been **removed or made private
+upstream** but are kept locally.
 
 ## Repo layout
 
-| Path                | What it is                                                         |
-|---------------------|--------------------------------------------------------------------|
-| `video_archiver.py` | The whole application: one script, standard library + `feedparser` |
-| `feeds.txt`         | User config: one feed URL per line, `#` comments                   |
-| `cron_run.sh`       | Cron wrapper: `cd` to the repo, run `scan` then `check`            |
-| `requirements.txt`  | `feedparser>=6.0`, `yt-dlp>=2024.0`                                 |
-| `README.md`         | End-user documentation                                             |
+| Path | What it is |
+|---|---|
+| `marion_stokes/detect.py` | Regexes that turn text into `VideoRef(platform, video_id, url, fetch_url)` |
+| `marion_stokes/feeds.py` | `load_feeds`, `scan_feed` (feedparser with `sanitize_html=False`) |
+| `marion_stokes/ytdlp.py` | Wrapper around the yt-dlp CLI: `download`, `probe`, `classify_error` → `Verdict` |
+| `marion_stokes/db.py` | SQLite schema **migrations** (`PRAGMA user_version`) and all queries |
+| `marion_stokes/workflows.py` | `run_scan`, `run_check`, `run_status`, `run_retry`, `run_export` |
+| `marion_stokes/cli.py` | argparse subcommands, logging, run lock, exit codes |
+| `marion_stokes/export.py`, `notify.py` | CSV/HTML export; ntfy-style POST notifications |
+| `video_archiver.py` | Thin shim so `python3 video_archiver.py <cmd>` keeps working |
+| `cron_run.sh` | Runs `scan` then `check`, uses `./.venv` if present |
+| `tests/` | pytest suite. yt-dlp is faked, except one test that uses the real binary on a local HTTP server |
+| `feeds.txt` | The user's config: one feed URL per line, `#` comments |
 
-Created at runtime in the working directory (not in git, and there is no `.gitignore` yet):
-`videos.db`, `downloads/<extractor>/<id> - <title>.mkv` (+ `.info.json`), `video_archiver.log`.
-
-## Requirements
-
-- **Python 3.11+.** The code uses `datetime.UTC` (3.11) and `X | None` type hints (3.10).
-- `yt-dlp` **on `PATH` as a command.** The script calls the executable with
-  `subprocess`; it never imports the Python module.
-- `ffmpeg` on `PATH`, to merge the separate best video and best audio streams into MKV.
+Created at runtime (and git-ignored): `videos.db`, `videos.db.lock`, `videos.db.bak-*`,
+`downloads/`, `*.log`.
 
 ## Commands
 
 ```bash
-pip install -r requirements.txt
-python3 video_archiver.py scan     # read feeds, download new videos, insert rows
-python3 video_archiver.py check    # re-probe every row, flip is_available
-python3 video_archiver.py status   # print counts + list of deleted videos
-# Global flags: --feeds FILE --db FILE --download-dir DIR --log FILE -v
+pip install -r requirements.txt -r requirements-dev.txt
+ruff check .           # lint (config in pyproject.toml)
+pytest -q              # full suite, a few seconds, no network needed
+python3 video_archiver.py {scan,check,status,retry,export} [options]
 ```
 
-There is **no test suite, linter config, or CI** yet. To check a change, at minimum:
-
-```bash
-python3 -m py_compile video_archiver.py
-# Pure functions can be exercised without network or yt-dlp:
-python3 -c "import video_archiver as v; print(v.find_video_urls('https://youtu.be/dQw4w9WgXcQ'))"
-```
-
-Use a throwaway `--db`, `--download-dir`, and `--log` when you test end to end,
-so you don't touch a real archive.
+CI (`.github/workflows/ci.yml`) runs ruff and pytest on Python 3.11–3.13. Run both
+before you push.
 
 ## Rules
 
-1. **Protect the archive.** `videos.db` and `downloads/` may be irreplaceable, because
-   the videos can be gone upstream, which is the point of the tool. Never delete,
-   move, or rewrite them, and don't write migrations that drop data. Schema changes
-   must be additive (`ALTER TABLE ... ADD COLUMN`) because `init_db` only runs
-   `CREATE TABLE IF NOT EXISTS`.
-2. **Don't mark a video deleted unless you're sure.** In `check_availability`,
-   an unclear yt-dlp error counts as *available* on purpose. Keep that bias:
-   wrongly reporting a deletion is worse than missing one.
-3. **Keep one row per video.** `url` is always the *canonical* URL
-   (`https://www.youtube.com/watch?v=ID` or `https://vimeo.com/ID`) and is `UNIQUE`.
-   New URL forms must pass through `canonical_url()` so they dedupe against existing rows.
-4. **Keep dependencies small.** Standard library, `feedparser`, and the `yt-dlp` CLI.
-   Ask before adding more.
-5. Match the existing style: section banners (`# ----`), small functions,
-   `logger` passed in explicitly, `%`-style logging arguments, type hints on signatures.
-6. When behavior or flags change, update `README.md` (users) and these docs (agents)
-   in the same change.
+1. **Protect the archive.** `videos.db` and `downloads/` may be irreplaceable,
+   because the originals may already be gone upstream. Never delete, move, or
+   rewrite user data. Schema changes go in a **new migration function** appended
+   to `db.MIGRATIONS`. Don't edit old migrations. Changes must be additive.
+   `migrate()` writes a backup before upgrading an existing DB. Keep it that way.
+2. **Don't mark a video gone unless you're sure.** Flagging a live video as deleted
+   is worse than missing a deletion. Anything not clearly recognised maps to
+   `Verdict.UNKNOWN`, which never changes state. Generic "gone" wording
+   (`GONE_WEAK`) needs `--confirm-checks` results in a row. When you add phrases to
+   `ytdlp._RULES`, add a test case to `tests/test_classify.py` with the real
+   yt-dlp message, and mind the rule order (see the comment there).
+3. **Keep one row per video.** Identity is `(platform, video_id)`. `url` is the
+   canonical URL. `fetch_url` is what yt-dlp gets (it keeps the unlisted-Vimeo hash).
+4. **Keep dependencies small.** Standard library, `feedparser`, and the `yt-dlp`
+   **executable**, called with `subprocess` so users can update it on its own.
+   Ask before adding anything else.
+5. **No network in tests.** Fake `ytdlp.download` / `ytdlp.probe` with
+   monkeypatch, as `tests/test_workflows.py` does. Feeds can be local XML files.
+6. Style: small functions, the `logger` passed in explicitly, `%`-style logging
+   arguments, type hints, section banners (`# ----`). The ruff config is in `pyproject.toml`.
+7. When behavior or options change, update `README.md`, these docs, and
+   `CHANGELOG.md` in the same change.
 
 ## Where to change things
 
-| Goal                                  | Where                                                               |
-|---------------------------------------|---------------------------------------------------------------------|
-| Detect a new URL shape or host        | `VIDEO_PATTERNS`, `detect_platform`, `extract_video_id`, `canonical_url` |
-| Add a platform                        | the above, plus the `CHECK(platform IN ...)` constraint in `DB_SCHEMA` (a table rebuild for existing DBs) |
-| Change download format or filenames   | `download_video` (`cmd`, `outtmpl`)                                 |
-| Change the deletion heuristics        | `check_availability` (`unavailable_signals`)                        |
-| Add a CLI subcommand                  | `main()` choices, plus a new `run_<name>(args, logger)`             |
-| Store a new field                     | `DB_SCHEMA`, `insert_video`, the `record` dict in `run_scan`, README schema table |
+| Goal | Where |
+|---|---|
+| Recognise a new URL form | `detect.py` patterns, plus a case in `tests/test_detect.py` |
+| Add a platform | `detect.py`, the `platform` CHECK constraint (needs a table rebuild migration), `canonical_url` |
+| Change download flags or file names | `ytdlp.build_download_cmd` |
+| Change how check results are read | `ytdlp._RULES` and `workflows.run_check` |
+| Add a column or table | New `_migrate_vN` in `db.py`, then `insert_video`, `workflows._save_download`, the README schema, `export.COLUMNS` |
+| Add a subcommand | `workflows.run_<name>`, `cli.COMMANDS`, `build_parser`, `NEEDS_LOCK`/`NEEDS_YTDLP` |
 
-## Traps to know before editing
+## Traps
 
-- The `url` and `canonical_url` columns always hold the same value.
-- Failed downloads are **not** recorded, so they are retried on every `scan`, indefinitely.
-- `file_size_bytes` is yt-dlp's *estimate*, not the size on disk.
-- `check` probes every row one after another, with no throttling. Its run time grows with the archive.
-- `main()` requires yt-dlp even for `status`.
-
-The full list, with reproductions, is in [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
+- CLI options go **after** the subcommand. `--feeds` and `--download-dir` are
+  accepted by every command on purpose, because `cron_run.sh` passes the same
+  arguments to `scan` and `check`.
+- `db.connect` opens in **autocommit** mode (`isolation_level=None`). Migrations run
+  in explicit `BEGIN`/`COMMIT` blocks.
+- The download command uses `--print after_move:%()j` with `--no-simulate`. That
+  prints the final info dict with the real `filepath`. If it prints nothing and
+  exits 0, the `!is_live` match filter skipped the video, and it is treated as
+  "upcoming".
+- yt-dlp warnings are ignored when classifying. Only `ERROR:` lines count.
+- Only English error strings are matched. yt-dlp output is English regardless of locale.

@@ -1,139 +1,148 @@
-# Video Archiver
+# marion-stokes
 
-RSS feed monitor that automatically detects, downloads, and tracks YouTube and Vimeo videos.
+Watches RSS feeds, archives every YouTube and Vimeo video they link to, and tells you when those videos disappear online.
+
+Named after [Marion Stokes](https://en.wikipedia.org/wiki/Marion_Stokes), who recorded television news around the clock for 35 years because she knew it would otherwise be lost.
 
 ## What it does
 
-1. **Scan** — Reads RSS feeds from `feeds.txt`, finds YouTube/Vimeo links in every entry, downloads each new video at the highest available quality, and logs it in a local SQLite database.
-2. **Check** — Re-checks every previously downloaded video to see if it's still available online. If a video has been deleted or made private, it sets an `is_available = 0` flag and records the deletion date. If a previously-deleted video comes back, it restores the flag.
-3. **Status** — Prints a summary of the database: total tracked, still available, and flagged as deleted.
+1. **`scan`** reads the feeds in `feeds.txt` and finds YouTube and Vimeo links in every entry, including `<iframe>` embeds in blog posts. It downloads each new video at the highest quality available, with its metadata and thumbnail, and records it in a local SQLite database. Failed downloads are retried later with increasing delays.
+2. **`check`** re-checks archived videos to see if they are still online. A video can be:
+   - **removed** or **private**: yt-dlp gave a definite message, so it is flagged right away.
+   - **unavailable**: yt-dlp gave only a generic "video unavailable" or 404. It is flagged only after several checks in a row agree (2 by default).
+   - **geo_blocked** or **restricted** (members-only, age-gated): the video still exists, so it is *not* flagged as deleted.
+
+   Rate limits, network errors and other unclear errors never flag a video. A video that comes back online is restored.
+3. **`status`** prints a summary: counts per state, local files that are missing, pending downloads, and the list of videos that are gone.
+4. **`export`** writes the index as CSV or as a self-contained HTML page. `--deleted-only` exports only the videos that are gone.
+5. **`retry`** makes the next scan try again on downloads that were given up on.
 
 ## Setup
 
-Requires **Python 3.11+**, the `yt-dlp` command on your `PATH`, and `ffmpeg`.
+Requires **Python 3.11+**, the `yt-dlp` command on your `PATH`, and `ffmpeg`, which merges the best video and audio streams.
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# yt-dlp also needs ffmpeg for merging best video+audio
-sudo apt install ffmpeg        # Debian/Ubuntu
-# or: sudo dnf install ffmpeg  # Fedora
-# or: brew install ffmpeg       # macOS
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt   # or: .venv/bin/pip install .
+sudo apt install ffmpeg                     # Debian/Ubuntu (dnf on Fedora, brew on macOS)
 ```
+
+yt-dlp needs updates often to keep working with YouTube: `.venv/bin/pip install -U yt-dlp`.
 
 ## Configuration
 
-Edit `feeds.txt` and add one RSS feed URL per line. Comments (`#`) and blank lines are ignored.
+Edit `feeds.txt` and add one RSS or Atom feed URL per line. Lines starting with `#` and blank lines are ignored.
 
 ```text
 # YouTube channel
 https://www.youtube.com/feeds/videos.xml?channel_id=UC_x5XG1OV2P6uZZ5FSM9Ttw
-
-# A blog that embeds Vimeo videos
+# YouTube playlist
+https://www.youtube.com/feeds/videos.xml?playlist_id=PLAYLIST_ID
+# A blog that embeds videos
 https://example.com/blog/feed
-
 # Vimeo user feed
 https://vimeo.com/someuser/videos/rss
 ```
 
-### Finding YouTube channel feed URLs
-
-Every YouTube channel has an RSS feed at:
-```
-https://www.youtube.com/feeds/videos.xml?channel_id=CHANNEL_ID
-```
-You can find the channel ID by viewing the page source of any YouTube channel page and searching for `channel_id`, or use a browser extension that reveals it.
+To find a YouTube channel's ID, view the page source of the channel page and search for `channel_id`.
 
 ## Usage
 
 ```bash
-# Scan feeds and download new videos
-python3 video_archiver.py scan
-
-# Check if previously downloaded videos are still online
-python3 video_archiver.py check
-
-# Show database summary
-python3 video_archiver.py status
-
-# Run both scan and check together
-python3 video_archiver.py scan && python3 video_archiver.py check
+python3 video_archiver.py scan      # read feeds, download new videos
+python3 video_archiver.py check     # re-check archived videos
+python3 video_archiver.py status    # summary
+python3 video_archiver.py retry     # retry downloads that were given up on
+python3 video_archiver.py export --format html -o gone.html --deleted-only
 ```
 
-### Options
+If you install it with `pip install .`, the same commands are also available as `marion-stokes <command>`, or as `python3 -m marion_stokes <command>`.
 
-| Flag              | Default            | Description                     |
-|-------------------|--------------------|---------------------------------|
-| `--feeds FILE`    | `feeds.txt`        | Path to the feeds list file     |
-| `--db FILE`       | `videos.db`        | SQLite database path            |
-| `--download-dir`  | `downloads/`       | Where videos are saved          |
-| `--log FILE`      | `video_archiver.log` | Log file path                 |
-| `-v, --verbose`   | off                | Verbose / debug output          |
+Options go **after** the command, for example `python3 video_archiver.py scan --feeds my.txt`.
 
-## Automating with cron
+| Option | Commands | Default | Description |
+|---|---|---|---|
+| `--db FILE` | all | `videos.db` | SQLite database |
+| `--feeds FILE` | all | `feeds.txt` | Feed list (used by `scan`) |
+| `--download-dir DIR` | all | `downloads/` | Where videos are saved (used by `scan`) |
+| `--log FILE` | all | `video_archiver.log` | Log file (`""` turns it off) |
+| `-v`, `--verbose` | all | off | Debug output on the console |
+| `--notify-url URL` | all | env `MARION_STOKES_NOTIFY_URL` | Send a notification when videos go offline or come back (used by `check`) |
+| `--max-downloads N` | scan | 0 (no limit) | Stop after N new downloads in a run |
+| `--max-attempts N` | scan | 10 | Stop retrying a failing download after N attempts |
+| `--subs` | scan | off | Also download subtitles in all languages |
+| `--no-thumbnails` | scan | off | Don't save thumbnails |
+| `--check-limit N` | check | 500 (env `MARION_STOKES_CHECK_LIMIT`) | Check at most N videos per run, least recently checked first. `0` checks all |
+| `--check-delay S` | check | 3 | Seconds to wait between checks |
+| `--confirm-checks N` | check | 2 | How many generic "unavailable" results in a row are needed before a video is flagged |
+| `--format csv\|html`, `-o FILE`, `--deleted-only` | export | csv, stdout | Export options |
 
-Use the included `cron_run.sh` to schedule scans. Make it executable and add a crontab entry:
+Exit codes: `0` ok, `1` fatal error, `2` finished but some feeds or videos had errors, `3` another run was already in progress.
+
+### Notifications
+
+`--notify-url` sends a plain-text POST, with the title in a `Title` header. That works as-is with [ntfy](https://ntfy.sh), either the hosted service or self-hosted: `--notify-url https://ntfy.sh/my-secret-topic`.
+
+## Running it on a schedule (cron)
+
+`cron_run.sh` runs `scan` and then `check`. `check` still runs if `scan` fails. If `./.venv` exists, the script uses it.
 
 ```bash
 chmod +x cron_run.sh
-
-# Run every 6 hours
 crontab -e
-# Add this line (adjust the path):
-0 */6 * * * /path/to/video_archiver/cron_run.sh >> /path/to/video_archiver/cron.log 2>&1
+# every 6 hours:
+0 */6 * * * MARION_STOKES_NOTIFY_URL=https://ntfy.sh/my-topic /path/to/marion-stokes/cron_run.sh >> /path/to/marion-stokes/cron.log 2>&1
 ```
 
-## Database schema
+Only one run can use the database at a time. The lock file is `videos.db.lock`, so overlapping cron runs simply exit with code 3. Because of `--check-limit`, each run checks the 500 least recently checked videos. A large archive is therefore covered over several runs, without overloading YouTube.
 
-The SQLite database (`videos.db`) has a single `videos` table:
+## Where things are stored
 
-| Column            | Type    | Description                                      |
-|-------------------|---------|--------------------------------------------------|
-| `id`              | INTEGER | Auto-increment primary key                       |
-| `url`             | TEXT    | Canonical video URL (unique)                     |
-| `canonical_url`   | TEXT    | Normalized URL                                   |
-| `title`           | TEXT    | Video title                                      |
-| `platform`        | TEXT    | `youtube` or `vimeo`                             |
-| `video_id`        | TEXT    | Platform-specific video ID                       |
-| `feed_source`     | TEXT    | The RSS feed URL where this was found            |
-| `download_path`   | TEXT    | Local file path of the downloaded video          |
-| `file_size_bytes` | INTEGER | File size                                        |
-| `duration`        | TEXT    | Video duration in seconds                        |
-| `uploader`        | TEXT    | Channel / uploader name                          |
-| `resolution`      | TEXT    | Download resolution                              |
-| `first_seen`      | TEXT    | ISO timestamp of first detection                 |
-| `last_checked`    | TEXT    | ISO timestamp of last availability check         |
-| `is_available`    | INTEGER | `1` = still online, **`0` = deleted/unavailable**|
-| `deleted_date`    | TEXT    | ISO timestamp when deletion was detected         |
-| `metadata_json`   | TEXT    | Full yt-dlp metadata as JSON                     |
+- `downloads/<extractor>/<id> - <title>.mkv`, plus `.info.json` (the full yt-dlp metadata) and the thumbnail.
+- `videos.db`, the SQLite index. The schema is upgraded automatically, and a backup (`videos.db.bak-v<N>-<timestamp>`) is written first.
+- `video_archiver.log`.
 
-### Querying the database directly
+None of these are committed to git (see `.gitignore`). **Back up `downloads/` and `videos.db`.** They may be the only copy left.
+
+### Database
+
+The `videos` table has one row per archived video:
+
+| Column | Description |
+|---|---|
+| `url` | Canonical URL (`https://www.youtube.com/watch?v=ID` or `https://vimeo.com/ID`), unique |
+| `fetch_url` | URL given to yt-dlp. Differs from `url` only for unlisted Vimeo videos, where it includes the privacy hash |
+| `platform`, `video_id` | `youtube` or `vimeo`, and the platform ID (unique together) |
+| `title`, `uploader`, `duration` (seconds), `resolution` | From yt-dlp |
+| `feed_source` | The feed the video was found in |
+| `download_path`, `file_size_bytes` | Local file and its real size on disk |
+| `first_seen`, `last_checked` | ISO 8601 UTC timestamps |
+| `availability` | `available`, `geo_blocked`, `restricted`, `removed`, `private`, or `unavailable` |
+| `is_available` | `1` = still exists online, **`0` = gone** (removed, private, or unavailable) |
+| `deleted_date` | When the video was first detected as gone |
+| `gone_strikes`, `gone_since` | Generic "unavailable" results in a row that have not yet confirmed a deletion |
+| `metadata_json` | A subset of the yt-dlp metadata |
+
+`failed_downloads` holds videos that were found but could not be downloaded yet: attempts, next retry time, last error, and whether it was given up on.
 
 ```bash
-# List all deleted videos
-sqlite3 videos.db "SELECT title, url, deleted_date FROM videos WHERE is_available = 0;"
-
-# Count by platform
+sqlite3 videos.db "SELECT title, url, availability, deleted_date FROM videos WHERE is_available = 0;"
 sqlite3 videos.db "SELECT platform, COUNT(*) FROM videos GROUP BY platform;"
-
-# Find large files
-sqlite3 videos.db "SELECT title, file_size_bytes/1048576 AS mb FROM videos ORDER BY file_size_bytes DESC LIMIT 10;"
+sqlite3 videos.db "SELECT url, attempts, last_error FROM failed_downloads WHERE gave_up = 1;"
 ```
 
-## How video detection works
+## Recognised links
 
-The scanner searches every RSS entry's link, title, summary, description, content blocks, media enclosures, and `media:content` / `media:player` fields for URLs matching YouTube and Vimeo patterns. This means it works with:
+- YouTube: `youtube.com/watch?v=`, `m.` and `music.` subdomains, `youtu.be/`, `/embed/`, `/v/`, `/shorts/`, `/live/`, `youtube-nocookie.com/embed/`
+- Vimeo: `vimeo.com/<id>`, unlisted `vimeo.com/<id>/<hash>`, `player.vimeo.com/video/<id>?h=<hash>`, and `/channels/…/<id>`, `/groups/…/videos/<id>`, `/album/…/video/<id>`, `/showcase/…/video/<id>`
 
-- Native YouTube channel RSS feeds (which directly contain video links)
-- Blog/news feeds that embed or link to YouTube/Vimeo videos within articles
-- Podcast feeds that reference video content
-- Any Atom or RSS 2.0 feed
+The scanner looks at each entry's link, title, summary, content, enclosures and `media:*` fields. It works with native YouTube and Vimeo feeds, blog feeds that embed videos, and any RSS 2.0 or Atom feed.
 
-## Download quality
+## Development
 
-Videos are downloaded at the **highest available quality** using `yt-dlp`'s `bestvideo+bestaudio/best` format selection, merged into MKV containers via ffmpeg. This means you'll typically get the best resolution available (often 4K or 1080p) with the best audio track.
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+ruff check . && pytest -q
+```
 
-## For contributors and AI agents
-
-See [`AGENTS.md`](AGENTS.md) (also loaded through `CLAUDE.md`), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), and [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
+See [`AGENTS.md`](AGENTS.md) (also loaded through `CLAUDE.md`), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) and [`CHANGELOG.md`](CHANGELOG.md).

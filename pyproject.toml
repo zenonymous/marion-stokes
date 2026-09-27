@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "marion-stokes"
+dynamic = ["version"]
+description = "Archive videos linked from RSS feeds and track which ones disappear online."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["feedparser>=6.0", "yt-dlp>=2024.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+marion-stokes = "marion_stokes.cli:main"
+
+[tool.setuptools]
+packages = ["marion_stokes"]
+
+[tool.setuptools.dynamic]
+version = { attr = "marion_stokes.__version__" }
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

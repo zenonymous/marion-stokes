@@ -1,0 +1,18 @@
+# Archive data: never commit
+videos.db
+videos.db-*
+*.db.lock
+*.db.bak-*
+downloads/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
